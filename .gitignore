@@ -1,3 +1,12 @@
+saved/*
+BC-*
+IQL-*
+TD3_BC-*
+CQL-*
+EDAC-*
+LB-SAC-*
+SAC-N-*
+
 # Internal stuff
 benchmark.py
 mlc_run.sh

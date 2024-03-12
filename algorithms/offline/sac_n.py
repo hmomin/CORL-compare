@@ -4,18 +4,24 @@
 import math
 import os
 import random
+import sys
 import uuid
 from copy import deepcopy
 from dataclasses import asdict, dataclass
 from typing import Any, Dict, List, Optional, Tuple, Union
 
-import d4rl
 import gym
 import numpy as np
 import pyrallis
 import torch
 import torch.nn as nn
 import wandb
+from tqdm import tqdm
+
+sys.path.append("..")
+sys.path.append("../..")
+
+from offline_env import OfflineEnv
 from torch.distributions import Normal
 from tqdm import trange
 
@@ -36,7 +42,7 @@ class TrainConfig:
     max_action: float = 1.0
     # training params
     buffer_size: int = 1_000_000
-    env_name: str = "halfcheetah-medium-v2"
+    env_name: str = "sys_default_norm_utility"
     batch_size: int = 256
     num_epochs: int = 3000
     num_updates_on_epoch: int = 1000
@@ -45,12 +51,14 @@ class TrainConfig:
     eval_episodes: int = 10
     eval_every: int = 5
     # general params
-    checkpoints_path: Optional[str] = None
+    checkpoints_path: Optional[str] = os.path.join(
+        os.path.dirname(os.path.abspath(__file__)), "..", ".."
+    )  # Save path
     deterministic_torch: bool = False
-    train_seed: int = 10
+    train_seed: int = 0
     eval_seed: int = 42
     log_every: int = 100
-    device: str = "cpu"
+    device: str = "cuda"
 
     def __post_init__(self):
         self.name = f"{self.name}-{self.env_name}-{str(uuid.uuid4())[:8]}"
@@ -89,85 +97,6 @@ def set_seed(
     random.seed(seed)
     torch.manual_seed(seed)
     torch.use_deterministic_algorithms(deterministic_torch)
-
-
-def wrap_env(
-    env: gym.Env,
-    state_mean: Union[np.ndarray, float] = 0.0,
-    state_std: Union[np.ndarray, float] = 1.0,
-    reward_scale: float = 1.0,
-) -> gym.Env:
-    def normalize_state(state):
-        return (state - state_mean) / state_std
-
-    def scale_reward(reward):
-        return reward_scale * reward
-
-    env = gym.wrappers.TransformObservation(env, normalize_state)
-    if reward_scale != 1.0:
-        env = gym.wrappers.TransformReward(env, scale_reward)
-    return env
-
-
-class ReplayBuffer:
-    def __init__(
-        self,
-        state_dim: int,
-        action_dim: int,
-        buffer_size: int,
-        device: str = "cpu",
-    ):
-        self._buffer_size = buffer_size
-        self._pointer = 0
-        self._size = 0
-
-        self._states = torch.zeros(
-            (buffer_size, state_dim), dtype=torch.float32, device=device
-        )
-        self._actions = torch.zeros(
-            (buffer_size, action_dim), dtype=torch.float32, device=device
-        )
-        self._rewards = torch.zeros((buffer_size, 1), dtype=torch.float32, device=device)
-        self._next_states = torch.zeros(
-            (buffer_size, state_dim), dtype=torch.float32, device=device
-        )
-        self._dones = torch.zeros((buffer_size, 1), dtype=torch.float32, device=device)
-        self._device = device
-
-    def _to_tensor(self, data: np.ndarray) -> torch.Tensor:
-        return torch.tensor(data, dtype=torch.float32, device=self._device)
-
-    # Loads data in d4rl format, i.e. from Dict[str, np.array].
-    def load_d4rl_dataset(self, data: Dict[str, np.ndarray]):
-        if self._size != 0:
-            raise ValueError("Trying to load data into non-empty replay buffer")
-        n_transitions = data["observations"].shape[0]
-        if n_transitions > self._buffer_size:
-            raise ValueError(
-                "Replay buffer is smaller than the dataset you are trying to load!"
-            )
-        self._states[:n_transitions] = self._to_tensor(data["observations"])
-        self._actions[:n_transitions] = self._to_tensor(data["actions"])
-        self._rewards[:n_transitions] = self._to_tensor(data["rewards"][..., None])
-        self._next_states[:n_transitions] = self._to_tensor(data["next_observations"])
-        self._dones[:n_transitions] = self._to_tensor(data["terminals"][..., None])
-        self._size += n_transitions
-        self._pointer = min(self._size, n_transitions)
-
-        print(f"Dataset size: {n_transitions}")
-
-    def sample(self, batch_size: int) -> TensorBatch:
-        indices = np.random.randint(0, min(self._size, self._pointer), size=batch_size)
-        states = self._states[indices]
-        actions = self._actions[indices]
-        rewards = self._rewards[indices]
-        next_states = self._next_states[indices]
-        dones = self._dones[indices]
-        return [states, actions, rewards, next_states, dones]
-
-    def add_transition(self):
-        # Use this method to add new data into the replay buffer during fine-tuning.
-        raise NotImplementedError
 
 
 # SAC Actor & Critic implementation
@@ -445,72 +374,20 @@ class SACN:
         self.alpha = self.log_alpha.exp().detach()
 
 
-@torch.no_grad()
-def eval_actor(
-    env: gym.Env, actor: Actor, device: str, n_episodes: int, seed: int
-) -> np.ndarray:
-    env.seed(seed)
-    actor.eval()
-    episode_rewards = []
-    for _ in range(n_episodes):
-        state, done = env.reset(), False
-        episode_reward = 0.0
-        while not done:
-            action = actor.act(state, device)
-            state, reward, done, _ = env.step(action)
-            episode_reward += reward
-        episode_rewards.append(episode_reward)
-
-    actor.train()
-    return np.array(episode_rewards)
-
-
-def return_reward_range(dataset, max_episode_steps):
-    returns, lengths = [], []
-    ep_ret, ep_len = 0.0, 0
-    for r, d in zip(dataset["rewards"], dataset["terminals"]):
-        ep_ret += float(r)
-        ep_len += 1
-        if d or ep_len == max_episode_steps:
-            returns.append(ep_ret)
-            lengths.append(ep_len)
-            ep_ret, ep_len = 0.0, 0
-    lengths.append(ep_len)  # but still keep track of number of steps
-    assert sum(lengths) == len(dataset["rewards"])
-    return min(returns), max(returns)
-
-
-def modify_reward(dataset, env_name, max_episode_steps=1000):
-    if any(s in env_name for s in ("halfcheetah", "hopper", "walker2d")):
-        min_ret, max_ret = return_reward_range(dataset, max_episode_steps)
-        dataset["rewards"] /= max_ret - min_ret
-        dataset["rewards"] *= max_episode_steps
-    elif "antmaze" in env_name:
-        dataset["rewards"] -= 1.0
-
-
 @pyrallis.wrap()
 def train(config: TrainConfig):
     set_seed(config.train_seed, deterministic_torch=config.deterministic_torch)
     wandb_init(asdict(config))
 
     # data, evaluation, env setup
-    eval_env = wrap_env(gym.make(config.env_name))
-    state_dim = eval_env.observation_space.shape[0]
-    action_dim = eval_env.action_space.shape[0]
+    env = OfflineEnv(config.env_name, normalize=False, device=config.device)
 
-    d4rl_dataset = d4rl.qlearning_dataset(eval_env)
-
-    if config.normalize_reward:
-        modify_reward(d4rl_dataset, config.env_name)
-
-    buffer = ReplayBuffer(
-        state_dim=state_dim,
-        action_dim=action_dim,
-        buffer_size=config.buffer_size,
-        device=config.device,
-    )
-    buffer.load_d4rl_dataset(d4rl_dataset)
+    state_dim = 56
+    action_dim = 4
+    
+    buffer = env.buffer
+    # NOTE: remap actions for tanh instead of sigmoid
+    buffer.tensor_actions = buffer.tensor_actions * 2 - 1
 
     # Actor & Critic setup
     actor = Actor(state_dim, action_dim, config.hidden_dim, config.max_action)
@@ -545,8 +422,15 @@ def train(config: TrainConfig):
     for epoch in trange(config.num_epochs, desc="Training"):
         # training
         for _ in trange(config.num_updates_on_epoch, desc="Epoch", leave=False):
-            batch = buffer.sample(config.batch_size)
-            update_info = trainer.update(batch)
+            batch = buffer.get_mini_batch(config.batch_size)
+            tensor_batch = [
+                batch["states"].to(torch.float32),
+                batch["actions"].to(torch.float32),
+                batch["rewards"].to(torch.float32).unsqueeze(-1),
+                batch["next_states"].to(torch.float32),
+                batch["dones"].to(torch.float32).unsqueeze(-1),
+            ]
+            update_info = trainer.update(tensor_batch)
 
             if total_updates % config.log_every == 0:
                 wandb.log({"epoch": epoch, **update_info})
@@ -555,30 +439,10 @@ def train(config: TrainConfig):
 
         # evaluation
         if epoch % config.eval_every == 0 or epoch == config.num_epochs - 1:
-            eval_returns = eval_actor(
-                env=eval_env,
-                actor=actor,
-                n_episodes=config.eval_episodes,
-                seed=config.eval_seed,
-                device=config.device,
+            torch.save(
+                trainer.state_dict(),
+                os.path.join(config.checkpoints_path, f"{epoch}.pt"),
             )
-            eval_log = {
-                "eval/reward_mean": np.mean(eval_returns),
-                "eval/reward_std": np.std(eval_returns),
-                "epoch": epoch,
-            }
-            if hasattr(eval_env, "get_normalized_score"):
-                normalized_score = eval_env.get_normalized_score(eval_returns) * 100.0
-                eval_log["eval/normalized_score_mean"] = np.mean(normalized_score)
-                eval_log["eval/normalized_score_std"] = np.std(normalized_score)
-
-            wandb.log(eval_log)
-
-            if config.checkpoints_path is not None:
-                torch.save(
-                    trainer.state_dict(),
-                    os.path.join(config.checkpoints_path, f"{epoch}.pt"),
-                )
 
     wandb.finish()
 
